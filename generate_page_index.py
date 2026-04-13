@@ -1,31 +1,35 @@
 """
 Generate a hierarchical page index tree from crawled website data.
 
-The tree mirrors the URL path structure of the crawled site, with each page
-further decomposed into its markdown heading hierarchy. Bedrock (Claude) is
-used to produce concise summaries for every node.
+The tree mirrors the URL path structure of the crawled site. Each node represents
+a page (not individual sections/headings). Bedrock is used to produce concise
+summaries for every page node.
 
 Usage:
     python generate_page_index.py crawl_output/fissionlabs.com_20260410_105854
     python generate_page_index.py crawl_output/fissionlabs.com_20260410_105854 --no-summaries
-    python generate_page_index.py crawl_output/fissionlabs.com_20260410_105854 --model-id anthropic.claude-3-haiku-20240307-v1:0
+    python generate_page_index.py crawl_output/fissionlabs.com_20260410_105854 --model-id us.anthropic.claude-haiku-4-5-20251001-v1:0
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
+import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-import os
-from dotenv import load_dotenv
-load_dotenv()
 
 import boto3
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -34,41 +38,49 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _bedrock_client = None
+_failed_summary_models: set[str] = set()
 
 SUMMARY_PROMPT = (
     "You are a technical writer. Given the following markdown content from a "
-    "web page section, write a concise 1-2 sentence summary (max 120 chars) "
-    "that captures the key purpose or topic of this section. "
+    "web page, write a concise summary "
+    "that captures the key purpose or topic of this page. "
     "Return ONLY the summary text, nothing else.\n\n"
+    "Page Title: {title}\n\n"
     "---\n{content}\n---"
 )
 
 DEFAULT_SUMMARY_MODEL = os.getenv(
-    # "BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-    "BEDROCK_MODEL_ID", "meta.llama4-maverick-17b-instruct-v1:0"
+    "SUMMARY_BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 )
 SUMMARY_MAX_TOKENS = 512
 SUMMARY_TEMPERATURE = 0.0
+MAX_PARALLEL_SUMMARIES = int(os.getenv("MAX_PARALLEL_SUMMARIES", "10"))
 
 
 def _get_bedrock_client():
     global _bedrock_client
     if _bedrock_client is None:
-        _bedrock_client = boto3.client("bedrock-runtime", region_name=os.getenv("AWS_REGION", "us-east-1"))
+        _bedrock_client = boto3.client(
+            "bedrock-runtime",
+            region_name=os.getenv("AWS_REGION", "us-east-1")
+        )
     return _bedrock_client
 
 
 def summarize_with_bedrock(
+    title: str,
     content: str,
     model_id: str = DEFAULT_SUMMARY_MODEL,
 ) -> str:
-    """Call Bedrock Model to produce a short summary of *content*."""
+    """Call Bedrock Model to produce a short summary of page content."""
     if not content or not content.strip():
         return ""
 
-    # truncated = content[:3000]
-    truncated = content
-    prompt = SUMMARY_PROMPT.format(content=truncated)
+    if model_id in _failed_summary_models:
+        return ""
+
+    truncated = content[:4000]
+    prompt = SUMMARY_PROMPT.format(title=title, content=truncated)
 
     client = _get_bedrock_client()
     body = json.dumps({
@@ -78,13 +90,33 @@ def summarize_with_bedrock(
         "messages": [{"role": "user", "content": prompt}],
     })
 
-    try:
-        resp = client.invoke_model(modelId=model_id, body=body)
-        result = json.loads(resp["body"].read())
-        return result["content"][0]["text"].strip()
-    except Exception:
-        logger.warning("Bedrock summarization failed for chunk, skipping", exc_info=True)
-        return ""
+    candidate_model_ids = [model_id]
+    if model_id.startswith("anthropic."):
+        candidate_model_ids.append(f"us.{model_id}")
+
+    last_error: Exception | None = None
+    for candidate in candidate_model_ids:
+        try:
+            resp = client.invoke_model(modelId=candidate, body=body)
+            result = json.loads(resp["body"].read())
+            text = result.get("content", [{}])[0].get("text", "")
+            if text:
+                return text.strip()
+        except ClientError as exc:
+            last_error = exc
+            continue
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    _failed_summary_models.add(model_id)
+    logger.warning(
+        "Bedrock summarization disabled for model '%s' after failure. "
+        "Use an inference-profile model ID (e.g. us.anthropic....). Error: %s",
+        model_id,
+        last_error,
+    )
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -92,14 +124,13 @@ def summarize_with_bedrock(
 # ---------------------------------------------------------------------------
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+_IMAGE_MD_PATTERN = re.compile(r"!\[.*?\]\(.*?\)")
 
-
-@dataclass
-class Section:
-    """A markdown heading and the content below it, before the next heading."""
-    level: int
-    title: str
-    content: str
+_SKIP_TITLES = frozenset({
+    "thank you! your submission has been received!",
+    "404",
+    "page not found",
+})
 
 
 def _clean_title(raw: str) -> str:
@@ -107,13 +138,6 @@ def _clean_title(raw: str) -> str:
     cleaned = _IMAGE_MD_PATTERN.sub("", raw).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned
-
-
-_SKIP_TITLES = frozenset({
-    "thank you! your submission has been received!",
-    "404",
-    "page not found",
-})
 
 
 def extract_title_from_markdown(md: str) -> str:
@@ -142,74 +166,17 @@ def is_error_page(md: str) -> bool:
     return False
 
 
-def parse_sections(md: str) -> list[Section]:
-    """Split markdown into heading-delimited sections."""
-    matches = list(_HEADING_RE.finditer(md))
-    if not matches:
-        return []
-
-    sections: list[Section] = []
-    for i, m in enumerate(matches):
-        level = len(m.group(1))
-        title = _clean_title(m.group(2))
-        if not title:
-            continue
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(md)
-        content = md[start:end].strip()
-        sections.append(Section(level=level, title=title, content=content))
-    return sections
-
-
-# ---------------------------------------------------------------------------
-# Boilerplate detection and removal
-# ---------------------------------------------------------------------------
-
-_NAV_BOILERPLATE_TITLES = frozenset({
-    "source url",
-    "innovation  \naccelerator",
-    "innovation accelerator",
-    "book a free consultation to unleash the full potential of digital transformation",
-    "thank you! your submission has been received!",
-})
-
-_NAV_BOILERPLATE_SUBSTRINGS = (
-    "transforming database querying",
-    "view file in another tab",
-    "oops! something went wrong",
-    "fission labs uses cookies",
+_SOURCE_URL_HEADER_RE = re.compile(
+    r"^#\s*Source URL\s*\n.*?\n---\s*\n",
+    re.MULTILINE | re.DOTALL,
 )
 
-_FOOTER_PATTERN = re.compile(
-    r"^(company|services|resources|contact us|©)",
-    re.I,
-)
 
-_IMAGE_MD_PATTERN = re.compile(r"!\[.*?\]\(.*?\)")
-
-
-def _is_boilerplate_section(section: Section) -> bool:
-    title_lower = section.title.lower().strip()
-    if title_lower in _NAV_BOILERPLATE_TITLES:
-        return True
-    if _FOOTER_PATTERN.match(title_lower):
-        return True
-    if "![" in section.title:
-        return True
-    for substr in _NAV_BOILERPLATE_SUBSTRINGS:
-        if substr in title_lower:
-            return True
-    content_lower = section.content.lower()
-    if "© " in content_lower and "all rights reserved" in content_lower:
-        return True
-    if not section.content.strip() and not section.title.strip():
-        return True
-    return False
-
-
-def filter_boilerplate(sections: list[Section]) -> list[Section]:
-    """Remove common nav/footer/boilerplate sections."""
-    return [s for s in sections if not _is_boilerplate_section(s)]
+def _clean_markdown_for_summary(md: str) -> str:
+    """Strip the source-URL header for summary generation."""
+    md = _SOURCE_URL_HEADER_RE.sub("", md, count=1)
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    return md.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -221,58 +188,25 @@ class IndexNode:
     title: str
     node_id: str = ""
     url: str = ""
+    markdown_file: str = ""
     summary: str = ""
-    content_preview: str = ""
     children: list[IndexNode] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"title": self.title, "node_id": self.node_id}
         if self.url:
             d["url"] = self.url
+        if self.markdown_file:
+            d["markdown_file"] = self.markdown_file
         if self.summary:
             d["summary"] = self.summary
-        if self.content_preview:
-            d["content_preview"] = self.content_preview
         if self.children:
             d["nodes"] = [c.to_dict() for c in self.children]
         return d
 
 
 # ---------------------------------------------------------------------------
-# Build section sub-tree for a single page
-# ---------------------------------------------------------------------------
-
-def _build_section_tree(sections: list[Section], page_url: str = "") -> list[IndexNode]:
-    """
-    Convert flat list of sections (with heading levels) into a nested tree.
-    Each section becomes an IndexNode; children are determined by heading level.
-    The page_url is propagated to all section nodes.
-    """
-    if not sections:
-        return []
-
-    root_nodes: list[IndexNode] = []
-    stack: list[tuple[int, IndexNode]] = []
-
-    for sec in sections:
-        node = IndexNode(
-            title=sec.title,
-            url=page_url,
-            content_preview=sec.content[:200].strip() if sec.content else "",
-        )
-        while stack and stack[-1][0] >= sec.level:
-            stack.pop()
-        if stack:
-            stack[-1][1].children.append(node)
-        else:
-            root_nodes.append(node)
-        stack.append((sec.level, node))
-
-    return root_nodes
-
-
-# ---------------------------------------------------------------------------
-# Build URL path tree
+# Build URL path tree (one node per page)
 # ---------------------------------------------------------------------------
 
 def _url_path_segments(url: str) -> list[str]:
@@ -287,8 +221,7 @@ def _build_url_tree(
 ) -> IndexNode:
     """
     Build a tree where the root is the website homepage and children are
-    nested by URL path segments. Each page's internal heading structure
-    is attached as deeper children.
+    nested by URL path segments. Each node represents a single page.
     """
     root_url = ""
     for p in pages:
@@ -337,34 +270,13 @@ def _build_url_tree(
     return root
 
 
-_SOURCE_URL_HEADER_RE = re.compile(
-    r"^#\s*Source URL\s*\n.*?\n---\s*\n",
-    re.MULTILINE | re.DOTALL,
-)
-
-_NAV_BLOCK_RE = re.compile(
-    r"^(Company|Services|Resources|Latest Blog|"
-    r"###\s+Transforming Database Querying.*?$)\s*\n?",
-    re.MULTILINE,
-)
-
-
-def _clean_markdown_for_preview(md: str) -> str:
-    """Strip the source-URL header and nav lines inserted by the crawler."""
-    md = _SOURCE_URL_HEADER_RE.sub("", md, count=1)
-    md = _NAV_BLOCK_RE.sub("", md)
-    md = re.sub(r"\n{3,}", "\n\n", md)
-    return md.strip()
-
-
 def _populate_page_node(
     node: IndexNode,
     page_info: dict,
     crawl_dir: Path,
-    max_section_depth: int = 3,
 ) -> bool:
     """
-    Read the markdown file for a page and fill in title + section children.
+    Read the markdown file for a page and fill in title + markdown_file path.
     Returns False if the page should be excluded (e.g. 404).
     """
     md_path = crawl_dir / page_info["markdown_file"]
@@ -388,33 +300,12 @@ def _populate_page_node(
             else "Home"
         )
 
-    raw_sections = parse_sections(md_content)
-    cleaned = filter_boilerplate(raw_sections)
-
-    page_title_lower = node.title.strip().lower()
-    cleaned = [
-        s for s in cleaned
-        if s.title.strip().lower() != page_title_lower
-    ]
-
-    # Limit section nesting depth: only keep headings within max_section_depth
-    # levels below the shallowest heading found
-    if cleaned:
-        min_level = min(s.level for s in cleaned)
-        cleaned = [s for s in cleaned if s.level <= min_level + max_section_depth - 1]
-
-    section_nodes = _build_section_tree(cleaned, page_url=page_info["url"])
-    node.children.extend(section_nodes)
-
-    clean_md = _clean_markdown_for_preview(md_content)
-    if clean_md:
-        node.content_preview = clean_md[:300].strip()
-
+    node.markdown_file = page_info["markdown_file"]
     return True
 
 
 # ---------------------------------------------------------------------------
-# Assign node IDs and generate summaries
+# Assign node IDs and generate summaries (parallel)
 # ---------------------------------------------------------------------------
 
 def _assign_ids(node: IndexNode, counter: list[int] | None = None) -> None:
@@ -426,27 +317,71 @@ def _assign_ids(node: IndexNode, counter: list[int] | None = None) -> None:
         _assign_ids(child, counter)
 
 
-def _generate_summaries(
-    node: IndexNode,
-    model_id: str,
-    progress: list[int] | None = None,
-    total: list[int] | None = None,
-) -> None:
-    if progress is None:
-        progress = [0]
-    if total is None:
-        total = [_count_nodes(node)]
-
-    text_for_summary = node.content_preview or node.title
-    if text_for_summary:
-        node.summary = summarize_with_bedrock(text_for_summary, model_id=model_id)
-
-    progress[0] += 1
-    if progress[0] % 5 == 0 or progress[0] == total[0]:
-        logger.info("Summaries: %d / %d", progress[0], total[0])
-
+def _collect_nodes_for_summary(node: IndexNode, nodes_list: list[IndexNode]) -> None:
+    """Collect all nodes that need summaries (have markdown_file)."""
+    if node.markdown_file:
+        nodes_list.append(node)
     for child in node.children:
-        _generate_summaries(child, model_id, progress, total)
+        _collect_nodes_for_summary(child, nodes_list)
+
+
+def _generate_single_summary(
+    node: IndexNode,
+    crawl_dir: Path,
+    model_id: str,
+) -> tuple[str, str]:
+    """Generate summary for a single node. Returns (node_id, summary)."""
+    if not node.markdown_file:
+        return (node.node_id, "")
+
+    md_path = crawl_dir / node.markdown_file
+    if not md_path.exists():
+        return (node.node_id, "")
+
+    md_content = md_path.read_text(encoding="utf-8")
+    clean_content = _clean_markdown_for_summary(md_content)
+
+    summary = summarize_with_bedrock(node.title, clean_content, model_id=model_id)
+    return (node.node_id, summary)
+
+
+def _generate_summaries_parallel(
+    root: IndexNode,
+    crawl_dir: Path,
+    model_id: str,
+    max_workers: int = MAX_PARALLEL_SUMMARIES,
+) -> None:
+    """Generate summaries for all nodes in parallel using ThreadPoolExecutor."""
+    nodes_list: list[IndexNode] = []
+    _collect_nodes_for_summary(root, nodes_list)
+
+    if not nodes_list:
+        return
+
+    node_id_to_node = {n.node_id: n for n in nodes_list}
+    total = len(nodes_list)
+    completed = 0
+
+    logger.info("Generating summaries for %d pages (max %d parallel)...", total, max_workers)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_generate_single_summary, node, crawl_dir, model_id): node.node_id
+            for node in nodes_list
+        }
+
+        for future in as_completed(futures):
+            node_id = futures[future]
+            try:
+                _, summary = future.result()
+                if summary:
+                    node_id_to_node[node_id].summary = summary
+            except Exception as e:
+                logger.warning("Summary generation failed for node %s: %s", node_id, e)
+
+            completed += 1
+            if completed % 10 == 0 or completed == total:
+                logger.info("Summaries: %d / %d", completed, total)
 
 
 def _count_nodes(node: IndexNode) -> int:
@@ -462,6 +397,7 @@ def generate_page_index(
     *,
     generate_summaries: bool = True,
     model_id: str = DEFAULT_SUMMARY_MODEL,
+    max_parallel: int = MAX_PARALLEL_SUMMARIES,
 ) -> dict[str, Any]:
     """
     Build the full page index tree from a crawl output directory.
@@ -485,12 +421,12 @@ def generate_page_index(
     _assign_ids(root)
 
     total = _count_nodes(root)
-    logger.info("Tree built with %d nodes", total)
+    logger.info("Tree built with %d nodes (1 per page)", total)
 
     if generate_summaries:
         logger.info("Generating summaries via Bedrock (%s) ...", model_id)
         start = time.time()
-        _generate_summaries(root, model_id)
+        _generate_summaries_parallel(root, crawl_dir, model_id, max_workers=max_parallel)
         elapsed = time.time() - start
         logger.info("Summaries completed in %.1fs", elapsed)
 
@@ -528,6 +464,12 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_SUMMARY_MODEL,
         help="Bedrock model ID for summary generation",
     )
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=MAX_PARALLEL_SUMMARIES,
+        help=f"Maximum parallel summary requests (default: {MAX_PARALLEL_SUMMARIES})",
+    )
     return parser.parse_args()
 
 
@@ -541,7 +483,9 @@ if __name__ == "__main__":
         args.crawl_dir,
         generate_summaries=not args.no_summaries,
         model_id=args.model_id,
+        max_parallel=args.max_parallel,
     )
+
     def _tree_summary(node_dict, depth=0, lines=None):
         if lines is None:
             lines = []
@@ -549,16 +493,17 @@ if __name__ == "__main__":
         title = node_dict["title"][:60]
         nid = node_dict["node_id"]
         url_str = f'  [{node_dict["url"]}]' if node_dict.get("url") else ""
+        md_file = f'  -> {node_dict["markdown_file"]}' if node_dict.get("markdown_file") else ""
         summary_str = f'  — {node_dict["summary"][:80]}' if node_dict.get("summary") else ""
-        lines.append(f"{indent}{nid}: {title}{url_str}{summary_str}")
+        lines.append(f"{indent}{nid}: {title}{url_str}{md_file}{summary_str}")
         for child in node_dict.get("nodes", []):
             _tree_summary(child, depth + 1, lines)
         return lines
 
     lines = _tree_summary(tree)
-    preview = "\n".join(lines[:80])
+    preview = "\n".join(lines[:50])
     print(preview)
-    if len(lines) > 80:
-        print(f"\n... and {len(lines) - 80} more nodes")
+    if len(lines) > 50:
+        print(f"\n... and {len(lines) - 50} more nodes")
     print(f"\nTotal nodes: {len(lines)}")
     print(f"Full output at: {Path(args.crawl_dir) / 'page_index.json'}")

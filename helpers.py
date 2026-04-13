@@ -67,14 +67,75 @@ def parse_model_json_response(model_response):
         updated_response,
     )
 
+    # Try to parse as JSON
     try:
         return json.loads(updated_response)
     except json.JSONDecodeError:
-        # Fallback for Python-dict-like payloads (single quotes, etc.).
+        pass
+
+    # Fix unescaped newlines inside JSON string values
+    # This handles cases where the model outputs literal newlines in strings
+    try:
+        fixed_response = _fix_json_newlines(updated_response)
+        return json.loads(fixed_response)
+    except (json.JSONDecodeError, Exception):
+        pass
+
+    # Fallback for Python-dict-like payloads (single quotes, etc.).
+    try:
         parsed = ast.literal_eval(updated_response)
         if isinstance(parsed, (dict, list)):
             return parsed
-        raise ValueError("Model response is not a valid JSON object or array")
+    except (ValueError, SyntaxError):
+        pass
+
+    raise ValueError("Model response is not a valid JSON object or array")
+
+
+def _fix_json_newlines(json_str: str) -> str:
+    """
+    Fix unescaped newlines inside JSON string values.
+    This handles cases where models output literal newlines instead of \\n.
+    """
+    result = []
+    in_string = False
+    escape_next = False
+    i = 0
+
+    while i < len(json_str):
+        char = json_str[i]
+
+        if escape_next:
+            result.append(char)
+            escape_next = False
+            i += 1
+            continue
+
+        if char == '\\':
+            result.append(char)
+            escape_next = True
+            i += 1
+            continue
+
+        if char == '"':
+            in_string = not in_string
+            result.append(char)
+            i += 1
+            continue
+
+        if in_string and char == '\n':
+            result.append('\\n')
+            i += 1
+            continue
+
+        if in_string and char == '\r':
+            i += 1
+            continue
+
+        result.append(char)
+        i += 1
+
+    return ''.join(result)
 
 
 def extract_domain_name(company_input: str) -> str:

@@ -7,17 +7,19 @@ A vector-free Retrieval-Augmented Generation (RAG) system for website content. T
 VectorLessRAG takes a different approach to RAG by leveraging the natural hierarchical structure of website content instead of vector similarity search. The system:
 
 1. **Crawls** a website and converts pages to markdown
-2. **Indexes** the content into a hierarchical tree structure based on URL paths and heading levels
-3. **Queries** the index using LLM-guided tree navigation to find relevant content
-4. **Generates** answers using the retrieved context
+2. **Indexes** the content into a hierarchical tree structure (one node per page)
+3. **Queries** the index using LLM-guided tree navigation to find relevant pages
+4. **Retrieves** full markdown content from selected pages
+5. **Generates** precise answers using the complete page content
 
 ## Features
 
-- **AI-Powered URL Filtering**: Uses LLM to intelligently filter URLs based on commercial/sales relevance
-- **Hierarchical Page Index**: Mirrors URL path structure with nested heading hierarchies
-- **LLM-Guided Tree Search**: Navigates the content tree to find relevant sections
+- **AI-Powered URL Filtering**: Uses LLM to intelligently filter URLs based on commercial/sales relevance (from iteration 1 onward)
+- **Hierarchical Page Index**: One node per page, mirroring URL path structure
+- **LLM-Guided Page Selection**: Navigates the index tree to find relevant pages
+- **Full Content Retrieval**: Answers are generated from complete markdown files, not snippets
+- **Parallel Summary Generation**: Fast index building with configurable parallelism
 - **No Vector Database Required**: Eliminates the need for embedding models and vector stores
-- **Automatic Summarization**: Generates concise summaries for each node using Bedrock
 - **Content Deduplication**: Detects and removes duplicate content across pages
 
 ## Installation
@@ -45,6 +47,8 @@ AWS_ACCESS_KEY_ID=your_access_key
 AWS_SECRET_ACCESS_KEY=your_secret_key
 BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
 BEDROCK_URL_FILTER_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
+ANSWER_BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
+MAX_PARALLEL_SUMMARIES=10
 ```
 
 ## Usage
@@ -76,15 +80,18 @@ python website_crawler.py https://example.com --no-ai-url-filter
 #### 2. Generate Page Index
 
 ```bash
-# With AI summaries
+# With AI summaries (parallel generation)
 python generate_page_index.py crawl_output/example.com_20260410_105854
+
+# With more parallel workers for faster generation
+python generate_page_index.py crawl_output/example.com_20260410_105854 --max-parallel 10
 
 # Without summaries (faster, for testing)
 python generate_page_index.py crawl_output/example.com_20260410_105854 --no-summaries
 
 # Custom model for summaries
 python generate_page_index.py crawl_output/example.com_20260410_105854 \
-    --model-id anthropic.claude-3-haiku-20240307-v1:0
+    --model-id us.anthropic.claude-haiku-4-5-20251001-v1:0
 ```
 
 #### 3. Query the Index
@@ -96,8 +103,11 @@ python query_page_index.py crawl_output/example.com_20260410_105854 "What servic
 # Interactive mode
 python query_page_index.py crawl_output/example.com_20260410_105854 --interactive
 
-# Verbose mode (shows reasoning and context)
+# Verbose mode (shows reasoning and retrieved pages)
 python query_page_index.py crawl_output/example.com_20260410_105854 -v "Tell me about their products"
+
+# Increase context limit for more detailed answers
+python query_page_index.py crawl_output/example.com_20260410_105854 --max-context 50000 "What services do they offer?"
 ```
 
 ### Using the Orchestrator
@@ -119,7 +129,7 @@ python orchestrator.py --crawl-dir crawl_output/example.com_20260410_105854 --sk
 VectorLessRag/
 ├── orchestrator.py           # Full pipeline orchestration
 ├── website_crawler.py        # Website crawling with AI URL filtering
-├── generate_page_index.py    # Hierarchical index generation
+├── generate_page_index.py    # Page index generation (one node per page)
 ├── query_page_index.py       # Tree-based retrieval and QA
 ├── run_full_website_pipeline.py  # Alternative crawl runner
 ├── helpers.py                # Utility functions
@@ -140,18 +150,18 @@ VectorLessRag/
 ### 1. Website Crawling
 
 The crawler performs iterative breadth-first crawling:
-- Starts from the homepage and discovers links
-- Uses AI to filter URLs based on commercial/sales relevance
+- Starts from the homepage (iteration 0) and discovers links
+- From iteration 1 onward, uses AI to filter URLs based on commercial/sales relevance
 - Converts pages to clean markdown
 - Removes duplicate content across pages
 
 ### 2. Page Index Generation
 
-The indexer builds a tree structure:
+The indexer builds a simple tree structure:
+- **One node per page** (not per heading/section)
 - URL path hierarchy (e.g., `/products/software` → nested nodes)
-- Markdown heading hierarchy within each page
-- AI-generated summaries for each node
-- Content previews for quick reference
+- Each node includes: `title`, `url`, `markdown_file`, `summary`
+- **Parallel summary generation** for speed (configurable workers)
 
 Example index structure:
 ```json
@@ -159,24 +169,31 @@ Example index structure:
   "title": "Example Company",
   "node_id": "0000",
   "url": "https://example.com",
+  "markdown_file": "pages_markdown/example.com/index.md",
   "summary": "Technology company offering software solutions",
   "nodes": [
     {
       "title": "Products",
       "node_id": "0001",
       "url": "https://example.com/products",
-      "nodes": [...]
+      "markdown_file": "pages_markdown/example.com/products.md",
+      "summary": "Product catalog with pricing and features"
     }
   ]
 }
 ```
 
-### 3. Tree-Based Retrieval
+### 3. Query Processing
 
-Query processing uses LLM-guided navigation:
-1. **Tree Search**: LLM analyzes the index tree and identifies relevant nodes
-2. **Content Resolution**: Selected nodes are resolved to their full markdown content
-3. **Answer Generation**: Retrieved context is sent to the answer model
+Query processing uses a three-stage approach:
+
+1. **Tree Search**: LLM analyzes the page index and selects up to 15 relevant pages based on summaries
+2. **Content Retrieval**: Full markdown content is loaded from selected pages (up to `max_context` characters)
+3. **Answer Generation**: Complete page content is sent to the answer model for precise responses
+
+**Context Limit**: By default, up to 300,000 characters of page content are sent to the answer model. This is enough for most use cases. If more pages are selected than fit in this limit, you'll see "Context limit reached, stopping at N pages". Use `--max-context` to increase this limit.
+
+**Token Limit**: All model calls (except summaries) use a max_tokens of 10,240 for comprehensive responses.
 
 ## Configuration Options
 
@@ -197,18 +214,22 @@ Query processing uses LLM-guided navigation:
 |--------|---------|-------------|
 | `--no-summaries` | false | Skip AI summary generation |
 | `--model-id` | claude-haiku | Model for summary generation |
+| `--max-parallel` | 10 | Max parallel summary requests |
 
 ### Query Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--tree-search-model` | claude-haiku | Model for tree navigation |
-| `--answer-model` | llama-4-maverick | Model for answer generation |
-| `--verbose` | false | Show reasoning and context |
+| `--tree-search-model` | claude-sonnet | Model for page selection |
+| `--answer-model` | claude-haiku | Model for answer generation |
+| `--max-context` | 300000 | Max chars of page content for answers |
+| `--verbose` | false | Show reasoning and retrieved pages |
 
 ## URL Filtering
 
 The AI URL filter uses a customizable prompt to determine which URLs are relevant for crawling. The prompt is located at `prompts/url_filtering_prompt.txt`.
+
+**Note**: AI filtering only applies from iteration 1 onward. Iteration 0 (homepage) always crawls all discovered links.
 
 **Included URLs:**
 - Products, services, solutions
@@ -228,10 +249,28 @@ The AI URL filter uses a customizable prompt to determine which URLs are relevan
 
 The system uses AWS Bedrock for AI capabilities:
 
-- **URL Filtering**: Claude Haiku 4.5
-- **Summary Generation**: Claude Haiku 4.5 or Llama 4 Maverick
-- **Tree Search**: Claude Haiku 4.5
-- **Answer Generation**: Llama 4 Maverick
+- **URL Filtering**: Claude Haiku 4.5 (from iteration 1)
+- **Summary Generation**: Claude Haiku 4.5 (parallel)
+- **Tree Search**: Claude Sonnet 4.5
+- **Answer Generation**: Claude Haiku 4.5
+
+## Troubleshooting
+
+### "Context limit reached, stopping at N pages"
+
+This means the selected pages exceed the `max_context` character limit (default: 300,000 chars). Solutions:
+- Increase limit: `--max-context 500000`
+- The LLM will work with the pages that fit; this is rarely an issue with the default 300k limit
+
+### "Bedrock summarization disabled for model..."
+
+The model ID format is incorrect. Use inference-profile style IDs:
+- ✅ `us.anthropic.claude-haiku-4-5-20251001-v1:0`
+- ❌ `anthropic.claude-haiku-4-5-20251001-v1:0`
+
+### Crawler only gets 1 page
+
+Check if `www.` vs non-`www.` domain mismatch. The crawler normalizes domains automatically, but ensure your starting URL is consistent.
 
 ## License
 

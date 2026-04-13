@@ -150,8 +150,11 @@ def _path(url: str) -> str:
 
 
 def _domain(url: str) -> str:
-    """Lowercase netloc for a URL."""
-    return urlparse(url).netloc.lower()
+    """Canonical host for a URL (lowercased, without leading www.)."""
+    host = urlparse(url).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
 
 
 def _slug_from_url(url: str) -> str:
@@ -307,10 +310,11 @@ def select_urls_to_crawl(
     max_per_category: int = MAX_PAGES_PER_CATEGORY,
     max_total: int = MAX_TOTAL_PAGES,
     use_ai_filter: bool = True,
+    current_iteration: int = 0,
 ) -> list[str]:
     """
     Select URLs to crawl using AI-based filtering for commercial relevance.
-    Homepage is always first. AI model filters URLs based on sales/commercial value.
+    Homepage is always first. AI filtering starts from iteration 1 onward.
     """
     base_url = normalize_website_url(base_url)
     base_domain = _domain(base_url)
@@ -327,9 +331,9 @@ def select_urls_to_crawl(
         seen.add(base_url)
         selected.append(base_url)
 
-    # Use AI-based filtering if enabled and we have URLs to filter
+    # Use AI-based filtering only from iteration 1 onward
     urls_to_filter = [u for u in same_domain if u not in seen]
-    if use_ai_filter and urls_to_filter:
+    if use_ai_filter and current_iteration >= 1 and urls_to_filter:
         filtered_urls = filter_urls_with_ai(urls_to_filter, max_urls=max_total)
         for url in filtered_urls:
             if url not in seen and len(selected) < max_total:
