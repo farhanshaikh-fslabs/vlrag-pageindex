@@ -5,6 +5,7 @@ using link classification and per-category caps. Returns (pages, case_study_page
 import asyncio
 import json
 import logging
+import os
 import re
 from collections import deque
 from datetime import datetime
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urljoin, urlparse, unquote
 
+import boto3
+from dotenv import load_dotenv
 from crawl4ai import AsyncWebCrawler
 
 from helpers import (
@@ -20,6 +23,8 @@ from helpers import (
     filter_commercial_urls,
     is_commercially_relevant_url,
 )
+
+load_dotenv()
 
 # -----------------------------------------------------------------------------
 # Constants
@@ -35,24 +40,95 @@ CATEGORY_PATTERNS = {
     )
 }
 
-BLOCKLISTED_PATH_SEGMENTS = frozenset({
-    "google", "instagram", "youtube", "vimeo", "twitter", "facebook", "linkedin",
-    "tiktok", "pinterest", "pintrest", "snapchat", "whatsapp", "telegram", "share", "subscribe",
-    "feed", "rss", "atom", "wp-content", "wp-includes", "wp-admin", "cdn", "static",
-    "assets", "img", "images", "css", "js", "fonts", "favicon", "robots", "sitemap",
-    "modules", "uploads",
-})
-
+# Only block non-content file extensions (images, static assets, etc.)
 BLOCKLISTED_EXTENSIONS = frozenset({
     "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "css", "js", "woff", "woff2",
-    "ttf", "eot", "pdf", "zip", "xml",
+    "ttf", "eot", "pdf", "zip", "xml", "mp4", "mp3", "wav", "avi", "mov",
 })
 
-NON_USEFUL_PATH_PATTERN = re.compile(
-    r"(login|logout|sign[-_]?in|sign[-_]?up|register|cart|checkout|account|profile|"
-    r"privacy|cookie|terms|sitemap|search|tag|author|wp-json|api|graphql)",
-    re.I,
+# ---------------------------------------------------------------------------
+# Bedrock AI URL filtering
+# ---------------------------------------------------------------------------
+
+_bedrock_client = None
+DEFAULT_URL_FILTER_MODEL = os.getenv(
+    "BEDROCK_URL_FILTER_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 )
+URL_FILTER_PROMPT_PATH = Path(__file__).parent / "prompts" / "url_filtering_prompt.txt"
+
+
+def _get_bedrock_client():
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client(
+            "bedrock-runtime",
+            region_name=os.getenv("AWS_REGION", "us-east-1")
+        )
+    return _bedrock_client
+
+
+def _load_url_filter_prompt() -> str:
+    """Load the URL filtering prompt template from file."""
+    if URL_FILTER_PROMPT_PATH.exists():
+        return URL_FILTER_PROMPT_PATH.read_text(encoding="utf-8")
+    raise FileNotFoundError(f"URL filtering prompt not found: {URL_FILTER_PROMPT_PATH}")
+
+
+def filter_urls_with_ai(
+    urls: list[str],
+    max_urls: int = 100,
+    model_id: str = DEFAULT_URL_FILTER_MODEL,
+) -> list[str]:
+    """
+    Use AI model to filter URLs based on sales/commercial relevance.
+    Returns a list of filtered URLs that are most relevant for sales research.
+    """
+    if not urls:
+        return []
+
+    # If we have very few URLs, return them all
+    if len(urls) <= 5:
+        return urls
+
+    prompt_template = _load_url_filter_prompt()
+    urls_list = "\n".join(urls)
+    prompt = prompt_template.format(
+        url_count=len(urls),
+        max_urls=max_urls,
+        urls_list=urls_list,
+    )
+
+    client = _get_bedrock_client()
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 8192,
+        "temperature": 0.0,
+        "messages": [{"role": "user", "content": prompt}],
+    })
+
+    try:
+        resp = client.invoke_model(modelId=model_id, body=body)
+        result = json.loads(resp["body"].read())
+        response_text = result["content"][0]["text"].strip()
+
+        # Parse URLs from response (one per line)
+        filtered_urls = []
+        for line in response_text.split("\n"):
+            line = line.strip()
+            if line and line.startswith("http"):
+                # Only keep URLs that were in the original list
+                if line in urls:
+                    filtered_urls.append(line)
+
+        logging.info(
+            "AI URL filter: %d -> %d URLs (model: %s)",
+            len(urls), len(filtered_urls), model_id
+        )
+        return filtered_urls if filtered_urls else urls[:max_urls]
+
+    except Exception as e:
+        logging.warning("AI URL filtering failed, returning original URLs: %s", e)
+        return urls[:max_urls]
 
 MAX_PAGES_PER_CATEGORY = 2
 MAX_PAGES_CASE_STUDIES = 50
@@ -125,7 +201,7 @@ def _normalize_url_fragment(url: str) -> str:
 
 
 def _is_blocklisted_path(path: str) -> bool:
-    """True if path has a blocklisted segment or asset extension."""
+    """True if path has a blocklisted file extension (non-content assets)."""
     raw = (path or "").strip()
     decoded = unquote(raw).strip("/").lower()
     parts = decoded.rstrip("/").split("/")
@@ -133,10 +209,6 @@ def _is_blocklisted_path(path: str) -> bool:
         last = parts[-1]
         ext = last.split(".")[-1].split("?")[0] if "." in last else ""
         if ext in BLOCKLISTED_EXTENSIONS:
-            return True
-    for seg in (s for s in decoded.split("/") if s):
-        first = (seg.split() or [seg])[0].lower()
-        if first in BLOCKLISTED_PATH_SEGMENTS or seg in BLOCKLISTED_PATH_SEGMENTS:
             return True
     return False
 
@@ -157,16 +229,13 @@ def _is_allowed_same_domain_url(url: str, base_domain: str) -> bool:
 
 def is_useful_same_domain_url(url: str, base_url: str) -> bool:
     """
-    True if URL is same-domain, non-blocklisted, and likely content-bearing.
-    Excludes common utility/auth/legal/filter endpoints.
+    True if URL is same-domain and non-blocklisted (no asset extensions).
+    Semantic URL filtering is delegated to the AI model via filter_urls_with_ai().
     """
     base_url = normalize_website_url(base_url)
     if not _is_allowed_same_domain_url(url, _domain(base_url)):
         return False
-    path = _path(url).strip().lower()
-    if path in {"", "/"}:
-        return True
-    return NON_USEFUL_PATH_PATTERN.search(path) is None
+    return True
 
 
 def _to_absolute_url(href: str, base: str) -> Optional[str]:
@@ -237,46 +306,50 @@ def select_urls_to_crawl(
     base_url: str,
     max_per_category: int = MAX_PAGES_PER_CATEGORY,
     max_total: int = MAX_TOTAL_PAGES,
+    use_ai_filter: bool = True,
 ) -> list[str]:
     """
-    Select up to max_per_category per category (higher cap for case_studies), max_total overall.
-    Homepage is always first. Uncategorized URLs fill remaining slots.
+    Select URLs to crawl using AI-based filtering for commercial relevance.
+    Homepage is always first. AI model filters URLs based on sales/commercial value.
     """
     base_url = normalize_website_url(base_url)
     base_domain = _domain(base_url)
     same_domain = _filter_same_domain_allowed(all_urls, base_url)
 
-    print("Same domain:", same_domain)
+    logging.info("Found %d same-domain URLs to filter", len(same_domain))
 
     seen: set[str] = set()
     selected: list[str] = []
     case_study_list = []
-    by_category: dict[str, list[str]] = {c: [] for c in CATEGORY_PATTERNS}
 
+    # Always include homepage first
     if base_url not in seen:
         seen.add(base_url)
         selected.append(base_url)
 
-    def add_if_under_cap(url: str, category: Optional[str]) -> bool:
-        if not category or url in seen or len(selected) >= max_total:
-            return False
-        if category == "case_studies":
-            print("Adding case study:", url)
-            case_study_list.append(url)
-        else:
-            selected.append(url)
+    # Use AI-based filtering if enabled and we have URLs to filter
+    urls_to_filter = [u for u in same_domain if u not in seen]
+    if use_ai_filter and urls_to_filter:
+        filtered_urls = filter_urls_with_ai(urls_to_filter, max_urls=max_total)
+        for url in filtered_urls:
+            if url not in seen and len(selected) < max_total:
+                seen.add(url)
+                # Separate case studies
+                if _classify_url(_path(url)) == "case_studies":
+                    case_study_list.append(url)
+                else:
+                    selected.append(url)
+    else:
+        # Fallback to category-based selection
+        for url in same_domain:
+            if url in seen or len(selected) >= max_total:
+                continue
+            category = _classify_url(_path(url))
+            if category == "case_studies":
+                case_study_list.append(url)
+            else:
+                selected.append(url)
             seen.add(url)
-        return True
-
-    for url in same_domain:
-        add_if_under_cap(url, _classify_url(_path(url)))
-
-    for url in same_domain:
-        if len(selected) >= max_total:
-            break
-        if url not in seen and _classify_url(_path(url)) is None:
-            seen.add(url)
-            selected.append(url)
 
     return selected[:max_total], case_study_list[:MAX_PAGES_CASE_STUDIES]
 
@@ -456,6 +529,7 @@ async def crawl_by_iterations(
     max_pages: int = 2000,
     useful_only: bool = True,
     apply_commercial_filter: bool = True,
+    use_ai_url_filter: bool = True,
     clean_markdown: bool = True,
     deduplicate: bool = True,
 ) -> dict[str, Any]:
@@ -464,6 +538,7 @@ async def crawl_by_iterations(
     Iteration 0 crawls the homepage. Iteration N crawls links found at N-1.
 
     apply_commercial_filter: at iteration >= 1, only enqueue commercially relevant URLs.
+    use_ai_url_filter: use AI model to filter URLs based on sales/commercial relevance.
     clean_markdown: run clean_markdown_content on every page's markdown.
     deduplicate: skip pages whose content fingerprint was already seen.
     """
@@ -527,13 +602,24 @@ async def crawl_by_iterations(
 
             links_to_enqueue = sorted(set(normalized_links))
 
-            if apply_commercial_filter and current_iteration >= 1:
+            # Apply URL filtering at iteration >= 1
+            if current_iteration >= 1 and links_to_enqueue:
                 before_count = len(links_to_enqueue)
-                links_to_enqueue = filter_commercial_urls(links_to_enqueue)
+
+                if use_ai_url_filter:
+                    # Use AI model to filter URLs
+                    links_to_enqueue = filter_urls_with_ai(
+                        links_to_enqueue,
+                        max_urls=min(100, max_pages - len(pages))
+                    )
+                elif apply_commercial_filter:
+                    # Fallback to rule-based commercial filter
+                    links_to_enqueue = filter_commercial_urls(links_to_enqueue)
+
                 rejected = before_count - len(links_to_enqueue)
                 if rejected:
                     filtered_out.setdefault(current_iteration, []).extend(
-                        [u for u in normalized_links if not is_commercially_relevant_url(u)]
+                        [u for u in normalized_links if u not in links_to_enqueue]
                     )
 
             for next_url in links_to_enqueue:
@@ -560,6 +646,7 @@ async def crawl_by_iterations(
         "max_pages": max_pages,
         "useful_only": useful_only,
         "apply_commercial_filter": apply_commercial_filter,
+        "use_ai_url_filter": use_ai_url_filter,
         "clean_markdown": clean_markdown,
         "deduplicate": deduplicate,
         "total_pages_crawled": len(pages),
@@ -632,6 +719,7 @@ def save_iterative_crawl_output(
         "max_pages": crawl_result.get("max_pages"),
         "useful_only": crawl_result.get("useful_only"),
         "apply_commercial_filter": crawl_result.get("apply_commercial_filter"),
+        "use_ai_url_filter": crawl_result.get("use_ai_url_filter"),
         "clean_markdown": crawl_result.get("clean_markdown"),
         "deduplicate": crawl_result.get("deduplicate"),
         "total_pages_crawled": crawl_result.get("total_pages_crawled"),
@@ -767,6 +855,11 @@ if __name__ == "__main__":
         help="Disable commercial-relevance URL filter on iteration >= 1 links",
     )
     parser.add_argument(
+        "--no-ai-url-filter",
+        action="store_true",
+        help="Disable AI-based URL filtering (uses rule-based filtering instead)",
+    )
+    parser.add_argument(
         "--no-clean-markdown",
         action="store_true",
         help="Disable markdown cleaning (image/link removal, whitespace collapse)",
@@ -785,6 +878,7 @@ if __name__ == "__main__":
             max_pages=max(1, args.max_pages),
             useful_only=not args.all_internal_urls,
             apply_commercial_filter=not args.no_commercial_filter,
+            use_ai_url_filter=not args.no_ai_url_filter,
             clean_markdown=not args.no_clean_markdown,
             deduplicate=not args.no_dedup,
         )

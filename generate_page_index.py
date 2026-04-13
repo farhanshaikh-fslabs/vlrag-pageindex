@@ -66,7 +66,8 @@ def summarize_with_bedrock(
     if not content or not content.strip():
         return ""
 
-    truncated = content[:3000]
+    # truncated = content[:3000]
+    truncated = content
     prompt = SUMMARY_PROMPT.format(content=truncated)
 
     client = _get_bedrock_client()
@@ -241,10 +242,11 @@ class IndexNode:
 # Build section sub-tree for a single page
 # ---------------------------------------------------------------------------
 
-def _build_section_tree(sections: list[Section]) -> list[IndexNode]:
+def _build_section_tree(sections: list[Section], page_url: str = "") -> list[IndexNode]:
     """
     Convert flat list of sections (with heading levels) into a nested tree.
     Each section becomes an IndexNode; children are determined by heading level.
+    The page_url is propagated to all section nodes.
     """
     if not sections:
         return []
@@ -255,6 +257,7 @@ def _build_section_tree(sections: list[Section]) -> list[IndexNode]:
     for sec in sections:
         node = IndexNode(
             title=sec.title,
+            url=page_url,
             content_preview=sec.content[:200].strip() if sec.content else "",
         )
         while stack and stack[-1][0] >= sec.level:
@@ -400,7 +403,7 @@ def _populate_page_node(
         min_level = min(s.level for s in cleaned)
         cleaned = [s for s in cleaned if s.level <= min_level + max_section_depth - 1]
 
-    section_nodes = _build_section_tree(cleaned)
+    section_nodes = _build_section_tree(cleaned, page_url=page_info["url"])
     node.children.extend(section_nodes)
 
     clean_md = _clean_markdown_for_preview(md_content)
