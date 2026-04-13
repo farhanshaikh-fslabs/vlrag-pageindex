@@ -140,3 +140,4 @@ cython_debug/
 # Extras
 crawl_output/
 run_full_website_pipeline.py
+*.ipynb
